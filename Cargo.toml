@@ -1,6 +1,25 @@
 [package]
 name = "aistore-object-store"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "AIStore ObjectStore implementation for the object_store crate"
+license = "Apache-2.0"
+repository = "https://github.com/example/aistore-object-store"
+keywords = ["aistore", "object-store", "cloud-storage"]
 
 [dependencies]
+object_store = { version = "0.12.5", features = ["cloud"] }
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+url = "2"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
