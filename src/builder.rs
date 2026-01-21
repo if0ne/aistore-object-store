@@ -1,19 +1,19 @@
 use std::sync::Arc;
-
-use object_store::client::HttpConnector;
+use std::time::Duration;
 
 use crate::{
-    client::{Client, ClientConfig},
+    client::{S3Client, S3Config},
     AiStore,
 };
 
 #[derive(Default)]
 pub struct AiStoreBuilder {
-    client_options: object_store::ClientOptions,
     endpoint: Option<String>,
     bucket_name: Option<String>,
-    max_redirects: Option<usize>,
     auth_jwt_token: Option<String>,
+    allow_http: bool,
+    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
     s3_api_via_root: bool,
 }
 
@@ -22,69 +22,97 @@ impl AiStoreBuilder {
         AiStoreBuilder::default()
     }
 
+    /// Set the AIStore endpoint URL (e.g., "aistore.example.com" or "localhost:8080")
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
         self
     }
 
+    /// Set the bucket name to use
     pub fn with_bucket_name(mut self, bucket_name: impl Into<String>) -> Self {
         self.bucket_name = Some(bucket_name.into());
         self
     }
 
+    /// Set the JWT authentication token
     pub fn with_auth_jwt_token(mut self, auth_jwt_token: impl Into<String>) -> Self {
         self.auth_jwt_token = Some(auth_jwt_token.into());
         self
     }
 
+    /// Allow HTTP connections (default: false, HTTPS only)
     pub fn with_allow_http(mut self, allow_http: bool) -> Self {
-        self.client_options = self.client_options.with_allow_http(allow_http);
+        self.allow_http = allow_http;
         self
     }
 
-    pub fn with_max_redirects(mut self, max_redirects: usize) -> Self {
-        self.max_redirects = Some(max_redirects);
+    /// Set the request timeout
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
+    /// Set the connection timeout
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Configure S3 API path routing.
+    ///
+    /// When `true`, the S3 API is served at the root: `http(s)://{endpoint}/{bucket}`
+    /// When `false` (default), the S3 API is served at: `http(s)://{endpoint}/s3/{bucket}`
     pub fn with_s3_api_via_root(mut self, s3_api_via_root: bool) -> Self {
         self.s3_api_via_root = s3_api_via_root;
         self
     }
 
-    pub fn build(mut self) -> object_store::Result<AiStore> {
-        let http = Arc::new(object_store::client::ReqwestConnector {});
-
+    /// Build the AiStore client
+    pub fn build(self) -> object_store::Result<AiStore> {
         let bucket = self.bucket_name.ok_or(BuilderError::MissingBucketName)?;
         let endpoint = self.endpoint.ok_or(BuilderError::MissingEndpoint)?;
 
         let url = if self.s3_api_via_root {
-            format!("https://{endpoint}/{bucket}")
+            format!("{endpoint}/{bucket}")
         } else {
-            format!("https://{endpoint}/s3/{bucket}")
+            format!("{endpoint}/s3/{bucket}")
         };
 
-        let header_map = self
-            .auth_jwt_token
-            .as_ref()
-            .and_then(|jwt| {
-                let mut header_map = object_store::HeaderMap::new();
-                header_map.insert(
-                    "Authorization",
-                    object_store::HeaderValue::from_str(&format!("Bearer {jwt}")).ok()?,
-                );
-                Some(header_map)
-            })
-            .unwrap_or_default();
+        let mut client_builder = reqwest::Client::builder();
 
-        self.client_options = self.client_options.with_default_headers(header_map);
+        if let Some(timeout) = self.timeout {
+            client_builder = client_builder.timeout(timeout);
+        }
 
-        let http_client = http.connect(&self.client_options)?;
+        if let Some(connect_timeout) = self.connect_timeout {
+            client_builder = client_builder.connect_timeout(connect_timeout);
+        }
 
-        let client_config = ClientConfig { url };
-        let client = Arc::new(Client::new(client_config, http_client));
+        let mut headers = reqwest::header::HeaderMap::new();
 
-        Ok(AiStore { client })
+        if let Some(jwt) = &self.auth_jwt_token {
+            let auth_value = reqwest::header::HeaderValue::from_str(&format!("Bearer {jwt}"))
+                .map_err(|e| BuilderError::InvalidAuthToken {
+                    message: e.to_string(),
+                })?;
+            headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        }
+
+        client_builder = client_builder
+            .default_headers(headers)
+            .https_only(!self.allow_http);
+
+        let http_client = client_builder
+            .build()
+            .map_err(|e| BuilderError::HttpClient { source: e })?;
+
+        let client_config = S3Config { url };
+        let client = Arc::new(S3Client::new(client_config, http_client));
+
+        Ok(AiStore {
+            client,
+            bucket_name: bucket,
+        })
     }
 }
 
@@ -95,6 +123,15 @@ pub enum BuilderError {
 
     #[error("Missing endpoint")]
     MissingEndpoint,
+
+    #[error("Invalid auth token: {message}")]
+    InvalidAuthToken { message: String },
+
+    #[error("Failed to build HTTP client: {source}")]
+    HttpClient {
+        #[source]
+        source: reqwest::Error,
+    },
 }
 
 impl From<BuilderError> for object_store::Error {
